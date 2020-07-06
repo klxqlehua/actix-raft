@@ -1,34 +1,28 @@
-//! The RaftNetwork interface.
+//! The Raft network interface.
 
-use actix::{
-    dev::ToEnvelope,
-    prelude::*,
-};
+use async_trait::async_trait;
 
-use crate::{
-    AppData,
-    messages::{
-        AppendEntriesRequest,
-        InstallSnapshotRequest,
-        VoteRequest,
-    },
-};
+use crate::{AppData, AppError};
+use crate::raft::{AppendEntriesRequest, AppendEntriesResponse};
+use crate::raft::{InstallSnapshotRequest, InstallSnapshotResponse};
+use crate::raft::{VoteRequest, VoteResponse};
 
-/// A trait defining the interface of a Raft network actor.
+/// A trait defining the interface for a Raft network between cluster members.
 ///
 /// See the [network chapter of the guide](https://railgun-rs.github.io/actix-raft/network.html)
 /// for details and discussion on this trait and how to implement it.
-pub trait RaftNetwork<D>
+#[async_trait]
+pub trait RaftNetwork<D, E>: Send + Sync + 'static
     where
         D: AppData,
-        Self: Actor<Context=Context<Self>>,
+        E: AppError,
+{
+    /// An RPC invoked by the leader to replicate log entries (§5.3); also used as heartbeat (§5.2).
+    async fn append_entries(&self, target: u64, msg: AppendEntriesRequest<D>) -> Result<AppendEntriesResponse, E>;
 
-        Self: Handler<AppendEntriesRequest<D>>,
-        Self::Context: ToEnvelope<Self, AppendEntriesRequest<D>>,
+    /// Invoked by the Raft leader to send chunks of a snapshot to a follower (§7).
+    async fn install_snapshot(&self, target: u64, msg: InstallSnapshotRequest) -> Result<InstallSnapshotResponse, E>;
 
-        Self: Handler<InstallSnapshotRequest>,
-        Self::Context: ToEnvelope<Self, InstallSnapshotRequest>,
-
-        Self: Handler<VoteRequest>,
-        Self::Context: ToEnvelope<Self, VoteRequest>,
-{}
+    /// An RPC invoked by candidates to gather votes (§5.2).
+    async fn vote(&self, target: u64, msg: VoteRequest) -> Result<VoteResponse, E>;
+}

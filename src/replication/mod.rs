@@ -43,7 +43,7 @@ struct LineRateState<D: AppData> {
     /// A buffer of data to replicate to the target follower.
     ///
     /// The buffered payload here will be expanded as more replication commands come in from the
-    /// Raft node while there is a buffered instance here.
+    /// Raft node while there is a pending outbound RPC.
     buffered_outbound: Vec<Arc<Entry<D>>>,
 }
 
@@ -477,88 +477,4 @@ impl<D: AppData, R: AppDataResponse, E: AppError, N: RaftNetwork<D>, S: RaftStor
     fn handle(&mut self, _: RSTerminate, ctx: &mut Self::Context) -> Self::Result {
         ctx.terminate();
     }
-}
-
-//////////////////////////////////////////////////////////////////////////////////////////////////
-// RSFatalStorageError ///////////////////////////////////////////////////////////////////////////
-
-/// An event representing a fatal storage error.
-#[derive(Message)]
-pub(crate) struct RSFatalStorageError<E: AppError> {
-    /// The ID of the Raft node which this event relates to.
-    pub target: NodeId,
-    /// The storage error which produced this event.
-    pub err: E,
-}
-
-//////////////////////////////////////////////////////////////////////////////////////////////////
-// RSFatalActixMessagingError ////////////////////////////////////////////////////////////////////
-
-/// An event representing a fatal actix messaging error.
-#[derive(Message)]
-pub(crate) struct RSFatalActixMessagingError {
-    /// The ID of the Raft node which this event relates to.
-    pub target: NodeId,
-    /// The actix mailbox error which produced this event.
-    pub err: MailboxError,
-    /// The dependency responsible for producing the error.
-    pub dependency: DependencyAddr,
-}
-
-//////////////////////////////////////////////////////////////////////////////////////////////////
-// RSRateUpdate //////////////////////////////////////////////////////////////////////////////////
-
-/// An event representing an update to the replication rate of a replication stream.
-#[derive(Message)]
-pub(crate) struct RSRateUpdate {
-    /// The ID of the Raft node which this event relates to.
-    pub target: NodeId,
-    /// A flag indicating if the corresponding target node is replicating at line rate.
-    ///
-    /// When replicating at line rate, the replication stream will receive log entires to
-    /// replicate as soon as they are ready. When not running at line rate, the Raft node will
-    /// only send over metadata without entries to replicate.
-    pub is_line_rate: bool,
-}
-
-//////////////////////////////////////////////////////////////////////////////////////////////////
-// RSRevertToFollower ////////////////////////////////////////////////////////////////////////////
-
-/// An event indicating that the Raft node needs to rever to follower state.
-#[derive(Message)]
-pub(crate) struct RSRevertToFollower {
-    /// The ID of the target node from which the new term was observed.
-    pub target: NodeId,
-    /// The new term observed.
-    pub term: u64,
-}
-
-//////////////////////////////////////////////////////////////////////////////////////////////////
-// RSNeedsSnapshot ///////////////////////////////////////////////////////////////////////////////
-
-/// An event from a replication stream requesting snapshot info.
-pub(crate) struct RSNeedsSnapshot;
-
-impl Message for RSNeedsSnapshot {
-    type Result = Result<RSNeedsSnapshotResponse, ()>;
-}
-
-/// A resonse from the Raft actor with information on the current snapshot.
-pub(crate) struct RSNeedsSnapshotResponse {
-    pub index: u64,
-    pub term: u64,
-    pub membership: MembershipConfig,
-    pub pointer: EntrySnapshotPointer,
-}
-
-//////////////////////////////////////////////////////////////////////////////////////////////////
-// RSUpdateMatchIndex ////////////////////////////////////////////////////////////////////////////
-
-/// An event from a replication stream which updates the target node's match index.
-#[derive(Message)]
-pub(crate) struct RSUpdateMatchIndex {
-    /// The ID of the target node for which the match index is to be updated.
-    pub target: NodeId,
-    /// The index of the most recent log known to have been successfully replicated on the target.
-    pub match_index: u64,
 }

@@ -1,33 +1,105 @@
-//! All public facing message types.
-//!
-//! For users of this Raft implementation, this module defines the data types of this crate's API.
-//! The `RaftNetwork` trait is based entirely off of these messages, and communication with the
-//! `Raft` actor is based entirely off of these messages and the messages in the `admin` module.
+use std::sync::Arc;
 
-use actix::prelude::*;
 use serde::{Serialize, Deserialize};
+use tokio::sync::{mpsc, oneshot, watch};
+use tokio::task::JoinHandle;
 
-use crate::{AppData, AppDataResponse, AppError, NodeId};
+use crate::{AppData, AppDataResponse, AppError, NodeId, RaftNetwork, RaftStorage};
+use crate::config::Config;
+use crate::error::{RaftError, Result};
+use crate::metrics::RaftMetrics;
+use crate::core::RaftCore;
+
+pub(crate) type TxAppendEntriesResponse<E> = oneshot::Sender<Result<AppendEntriesResponse, E>>;
+pub(crate) type TxVoteResponse<E> = oneshot::Sender<Result<VoteResponse, E>>;
+pub(crate) type TxInstallSnapshotResponse<E> = oneshot::Sender<Result<InstallSnapshotResponse, E>>;
+pub(crate) type TxClientResponse<R, E> = oneshot::Sender<Result<ClientResponse<R>, E>>;
+
+pub(crate) type RxChanAppendEntries<D, E> = mpsc::UnboundedReceiver<(AppendEntriesRequest<D>, TxAppendEntriesResponse<E>)>;
+pub(crate) type RxChanVote<E> = mpsc::UnboundedReceiver<(VoteRequest, TxVoteResponse<E>)>;
+pub(crate) type RxChanInstallSnapshot<E> = mpsc::UnboundedReceiver<(InstallSnapshotRequest, TxInstallSnapshotResponse<E>)>;
+pub(crate) type RxChanClient<D, R, E> = mpsc::UnboundedReceiver<(ClientRequest<D, R, E>, TxClientResponse<R, E>)>;
+
+pub(crate) type TxChanAppendEntries<D, E> = mpsc::UnboundedSender<(AppendEntriesRequest<D>, TxAppendEntriesResponse<E>)>;
+pub(crate) type TxChanVote<E> = mpsc::UnboundedSender<(VoteRequest, TxVoteResponse<E>)>;
+pub(crate) type TxChanInstallSnapshot<E> = mpsc::UnboundedSender<(InstallSnapshotRequest, TxInstallSnapshotResponse<E>)>;
+pub(crate) type TxChanClient<D, R, E> = mpsc::UnboundedSender<(ClientRequest<D, R, E>, TxClientResponse<R, E>)>;
+
+/// TODO: docs
+pub struct Raft<D: AppData, R: AppDataResponse, E: AppError, N: RaftNetwork<D, E>, S: RaftStorage<D, R, E>> {
+    tx_append_entries: TxChanAppendEntries<D, E>,
+    tx_vote: TxChanVote<E>,
+    tx_install_snapshot: TxChanInstallSnapshot<E>,
+    tx_client: TxChanClient<D, R, E>,
+    rx_metrics: watch::Receiver<RaftMetrics>,
+    raft_handle: JoinHandle<Result<(), E>>,
+    _marker_n: std::marker::PhantomData<N>,
+    _marker_s: std::marker::PhantomData<S>,
+}
+
+impl<D: AppData, R: AppDataResponse, E: AppError, N: RaftNetwork<D, E>, S: RaftStorage<D, R, E>> Raft<D, R, E, N, S> {
+    /// Spawn a new Raft instance.
+    pub async fn spawn(id: NodeId, config: Config, network: Arc<N>, storage: Arc<S>) -> Self {
+        let (tx_append_entries, rx_append_entries) = mpsc::unbounded_channel();
+        let (tx_vote, rx_vote) = mpsc::unbounded_channel();
+        let (tx_install_snapshot, rx_install_snapshot) = mpsc::unbounded_channel();
+        let (tx_client, rx_client) = mpsc::unbounded_channel();
+        let (tx_metrics, rx_metrics) = watch::channel(RaftMetrics::initial(id, MembershipConfig::new_initial(id)));
+        let raft_handle = RaftCore::spawn(
+            id, config, network, storage,
+            rx_append_entries, rx_vote, rx_install_snapshot, rx_client, tx_metrics,
+        );
+        Self{
+            tx_append_entries, tx_vote, tx_install_snapshot, tx_client, rx_metrics, raft_handle,
+            _marker_n: std::marker::PhantomData, _marker_s: std::marker::PhantomData,
+        }
+    }
+
+    /// An RPC invoked by the leader to replicate log entries (§5.3); also used as heartbeat (§5.2).
+    pub async fn append_entries(&self, msg: AppendEntriesRequest<D>) -> Result<AppendEntriesResponse, E> {
+        let (tx, rx) = oneshot::channel();
+        self.tx_append_entries.send((msg, tx)).map_err(|_| RaftError::ShuttingDown)?;
+        Ok(rx.await.map_err(|_| RaftError::ShuttingDown).and_then(|res| res)?)
+    }
+
+    /// An RPC invoked by candidates to gather votes (§5.2).
+    pub async fn vote(&self, msg: VoteRequest) -> Result<VoteResponse, E> {
+        let (tx, rx) = oneshot::channel();
+        self.tx_vote.send((msg, tx)).map_err(|_| RaftError::ShuttingDown)?;
+        Ok(rx.await.map_err(|_| RaftError::ShuttingDown).and_then(|res| res)?)
+    }
+
+    /// An RPC invoked by the Raft leader to send chunks of a snapshot to a follower (§7).
+    pub async fn install_snapshot(&self, msg: InstallSnapshotRequest) -> Result<InstallSnapshotResponse, E> {
+        let (tx, rx) = oneshot::channel();
+        self.tx_install_snapshot.send((msg, tx)).map_err(|_| RaftError::ShuttingDown)?;
+        Ok(rx.await.map_err(|_| RaftError::ShuttingDown).and_then(|res| res)?)
+    }
+
+    /// An RPC invoked by an external client to update the state of the system (§5.1).
+    pub async fn client(&self, msg: ClientRequest<D, R, E>) -> Result<ClientResponse<R>, E> {
+        let (tx, rx) = oneshot::channel();
+        self.tx_client.send((msg, tx)).map_err(|_| RaftError::ShuttingDown)?;
+        Ok(rx.await.map_err(|_| RaftError::ShuttingDown).and_then(|res| res)?)
+    }
+
+    /// Get a handle to the metrics channel.
+    pub fn metrics(&self) -> watch::Receiver<RaftMetrics> {
+        self.rx_metrics.clone()
+    }
+
+    /// Get the Raft core JoinHandle, consuming this interface.
+    pub fn core_handle(self) -> tokio::task::JoinHandle<Result<(), E>> {
+        self.raft_handle
+    }
+}
 
 //////////////////////////////////////////////////////////////////////////////////////////////////
-// AppendEntriesRequest //////////////////////////////////////////////////////////////////////////
+//////////////////////////////////////////////////////////////////////////////////////////////////
 
 /// An RPC invoked by the leader to replicate log entries (§5.3); also used as heartbeat (§5.2).
-///
-/// ### actix::Message
-/// Applications using this Raft implementation are responsible for implementing the
-/// networking/transport layer which must move RPCs between nodes. Once the application instance
-/// recieves a Raft RPC, it must send the RPC to the Raft node via its `actix::Addr` and then
-/// return the response to the original sender.
-///
-/// The result type of calling the Raft actor with this message type is
-/// `Result<AppendEntriesResponse, ()>`. The Raft spec assigns no significance to failures during
-/// the handling or sending of RPCs and all RPCs are handled in an idempotent fashion, so Raft
-/// will almost always retry sending a failed RPC, depending on the state of the Raft.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AppendEntriesRequest<D: AppData> {
-    /// A non-standard field, this is the ID of the intended recipient of this RPC.
-    pub target: u64,
     /// The leader's current term.
     pub term: u64,
     /// The leader's ID. Useful in redirecting clients.
@@ -44,14 +116,6 @@ pub struct AppendEntriesRequest<D: AppData> {
     pub entries: Vec<Entry<D>>,
     /// The leader's commit index.
     pub leader_commit: u64,
-}
-
-impl<D: AppData> Message for AppendEntriesRequest<D> {
-    /// The result type of this message.
-    ///
-    /// The `Result::Err` type is `()` as Raft assigns no significance to RPC failures, they will
-    /// be retried almost always as long as permitted by the current state of the Raft.
-    type Result = Result<AppendEntriesResponse, ()>;
 }
 
 /// An RPC response to an `AppendEntriesRequest` message.
@@ -138,12 +202,12 @@ pub struct EntryConfigChange {
 /// RPC will be sent instead.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct EntrySnapshotPointer {
-    /// The location of the snapshot file on disk.
-    pub path: String,
+    /// The ID of the snapshot, which is application specific, and probably only meaningful to the storage layer.
+    pub id: String,
 }
 
 //////////////////////////////////////////////////////////////////////////////////////////////////
-// MembershipConfig //////////////////////////////////////////////////////////////////////////////
+//////////////////////////////////////////////////////////////////////////////////////////////////
 
 /// A model of the membership configuration of the cluster.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -162,6 +226,11 @@ pub struct MembershipConfig {
 }
 
 impl MembershipConfig {
+    /// Create a new initial config containing only the given node ID.
+    pub(crate) fn new_initial(id: NodeId) -> Self {
+        Self{is_in_joint_consensus: false, members: vec![id], non_voters: vec![], removing: vec![]}
+    }
+
     /// Check if the given NodeId exists in this membership config.
     ///
     /// This checks only the contents of `members` & `non_voters`.
@@ -181,24 +250,11 @@ impl MembershipConfig {
 }
 
 //////////////////////////////////////////////////////////////////////////////////////////////////
-// VoteRequest ///////////////////////////////////////////////////////////////////////////////////
+//////////////////////////////////////////////////////////////////////////////////////////////////
 
 /// An RPC invoked by candidates to gather votes (§5.2).
-///
-/// ### actix::Message
-/// Applications using this Raft implementation are responsible for implementing the
-/// networking/transport layer which must move RPCs between nodes. Once the application instance
-/// recieves a Raft RPC, it must send the RPC to the Raft node via its `actix::Addr` and then
-/// return the response to the original sender.
-///
-/// The result type of calling the Raft actor with this message type is `Result<VoteResponse, ()>`.
-/// The Raft spec assigns no significance to failures during the handling or sending of RPCs and
-/// all RPCs are handled in an idempotent fashion, so Raft will almost always retry sending a
-/// failed RPC, depending on the state of the Raft.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct VoteRequest {
-    /// A non-standard field, this is the ID of the intended recipient of this RPC.
-    pub target: u64,
     /// The candidate's current term.
     pub term: u64,
     /// The candidate's ID.
@@ -209,18 +265,10 @@ pub struct VoteRequest {
     pub last_log_term: u64,
 }
 
-impl Message for VoteRequest {
-    /// The result type of this message.
-    ///
-    /// The `Result::Err` type is `()` as Raft assigns no significance to RPC failures, they will
-    /// be retried almost always as long as permitted by the current state of the Raft.
-    type Result = Result<VoteResponse, ()>;
-}
-
 impl VoteRequest {
     /// Create a new instance.
-    pub fn new(target: u64, term: u64, candidate_id: u64, last_log_index: u64, last_log_term: u64) -> Self {
-        Self{target, term, candidate_id, last_log_index, last_log_term}
+    pub fn new(term: u64, candidate_id: u64, last_log_index: u64, last_log_term: u64) -> Self {
+        Self{term, candidate_id, last_log_index, last_log_term}
     }
 }
 
@@ -239,24 +287,11 @@ pub struct VoteResponse {
 }
 
 //////////////////////////////////////////////////////////////////////////////////////////////////
-// InstallSnapshotRequest ////////////////////////////////////////////////////////////////////////
+//////////////////////////////////////////////////////////////////////////////////////////////////
 
-/// Invoked by the Raft leader to send chunks of a snapshot to a follower (§7).
-///
-/// ### actix::Message
-/// Applications using this Raft implementation are responsible for implementing the
-/// networking/transport layer which must move RPCs between nodes. Once the application instance
-/// recieves a Raft RPC, it must send the RPC to the Raft node via its `actix::Addr` and then
-/// return the response to the original sender.
-///
-/// The result type of calling the Raft actor with this message type is
-/// `Result<InstallSnapshotResponse, ()>`. The Raft spec assigns no significance to failures during
-/// the handling or sending of RPCs and all RPCs are handled in an idempotent fashion, so Raft will
-/// almost always retry sending a failed RPC, depending on the state of the Raft.
+/// An RPC invoked by the Raft leader to send chunks of a snapshot to a follower (§7).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct InstallSnapshotRequest {
-    /// A non-standard field, this is the ID of the intended recipient of this RPC.
-    pub target: u64,
     /// The leader's current term.
     pub term: u64,
     /// The leader's ID. Useful in redirecting clients.
@@ -273,14 +308,6 @@ pub struct InstallSnapshotRequest {
     pub done: bool,
 }
 
-impl Message for InstallSnapshotRequest {
-    /// The result type of this message.
-    ///
-    /// The `Result::Err` type is `()` as Raft assigns no significance to RPC failures, they will
-    /// almost always be retried as long as permitted by the current state of the Raft.
-    type Result = Result<InstallSnapshotResponse, ()>;
-}
-
 /// An RPC response to an `InstallSnapshotResponse` message.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct InstallSnapshotResponse {
@@ -289,26 +316,14 @@ pub struct InstallSnapshotResponse {
 }
 
 //////////////////////////////////////////////////////////////////////////////////////////////////
-// ClientPayload /////////////////////////////////////////////////////////////////////////////////
+//////////////////////////////////////////////////////////////////////////////////////////////////
 
-/// A payload with an entry coming from a client request.
+/// An RPC invoked by some external client to update the state of the system (§5.1).
 ///
 /// The entries of this payload will be appended to the Raft log and then applied to the Raft state
 /// machine according to the Raft protocol.
-///
-/// ### actix::Message
-/// Applications using this Raft implementation are responsible for implementing the
-/// networking/transport layer which must move RPCs between nodes. Once the application instance
-/// recieves a Raft RPC, it must send the RPC to the Raft node via its `actix::Addr` and then
-/// return the response to the original sender.
-///
-/// The result type of calling the Raft actor with this message type is
-/// `Result<ClientPayloadResponse, StorageError>`. Applications built around this implementation of
-/// Raft will often need to perform their own custom logic in the storage layer and often times it
-/// is critical to be able to surface such errors to the application and its clients. To meet that
-/// end, `ClientError` allows for the communication of application specific errors.
 #[derive(Debug, Serialize, Deserialize)]
-pub struct ClientPayload<D: AppData, R: AppDataResponse, E: AppError> {
+pub struct ClientRequest<D: AppData, R: AppDataResponse, E: AppError> {
     /// The application specific contents of this client request.
     #[serde(bound="D: AppData")]
     pub(crate) entry: EntryPayload<D>,
@@ -320,7 +335,7 @@ pub struct ClientPayload<D: AppData, R: AppDataResponse, E: AppError> {
     marker1: std::marker::PhantomData<E>,
 }
 
-impl<D: AppData, R: AppDataResponse, E: AppError> ClientPayload<D, R, E> {
+impl<D: AppData, R: AppDataResponse, E: AppError> ClientRequest<D, R, E> {
     /// Create a new client payload instance with a normal entry type.
     pub fn new(entry: EntryNormal<D>, response_mode: ResponseMode) -> Self {
         Self::new_base(EntryPayload::Normal(entry), response_mode)
@@ -342,11 +357,6 @@ impl<D: AppData, R: AppDataResponse, E: AppError> ClientPayload<D, R, E> {
     pub(crate) fn new_blank_payload() -> Self {
         Self::new_base(EntryPayload::Blank, ResponseMode::Committed)
     }
-}
-
-impl<D: AppData, R: AppDataResponse, E: AppError> Message for ClientPayload<D, R, E> {
-    /// The result type of this message.
-    type Result = Result<ClientPayloadResponse<R>, ClientError<D, R, E>>;
 }
 
 /// The desired response mode for a client request.
@@ -374,7 +384,7 @@ pub enum ResponseMode {
 
 /// A response to a client payload proposed to the Raft system.
 #[derive(Debug, Serialize, Deserialize)]
-pub enum ClientPayloadResponse<R: AppDataResponse> {
+pub enum ClientResponse<R: AppDataResponse> {
     /// A client response issued just after the request was committed to the cluster.
     Committed {
         /// The log index of the successfully processed client request.
@@ -389,7 +399,7 @@ pub enum ClientPayloadResponse<R: AppDataResponse> {
     },
 }
 
-impl<R: AppDataResponse> ClientPayloadResponse<R> {
+impl<R: AppDataResponse> ClientResponse<R> {
     /// The index of the log entry corresponding to this response object.
     pub fn index(&self) -> u64 {
         match self {
@@ -397,44 +407,65 @@ impl<R: AppDataResponse> ClientPayloadResponse<R> {
             Self::Applied{index, ..} => *index,
         }
     }
-}
 
-/// Error variants which may arise while handling client requests.
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(tag="type")]
-pub enum ClientError<D: AppData, R: AppDataResponse, E: AppError> {
-    /// Some error which has taken place internally in Raft.
-    Internal,
-    /// An application specific error.
-    #[serde(bound="E: AppError")]
-    Application(E),
-    /// The Raft node returning this error is not the Raft leader.
-    ///
-    /// Forward the payload to the specified leader. If the leader is unknown, it is up to the
-    /// application to determine how to handle. The payload can be buffered in the app until the
-    /// new leader is known, or it can be returned to the client as an error and the client can be
-    /// instructed to send to a new random node until the leader is known.
-    ///
-    /// The process of electing a new leader is usually a very fast process in Raft, so buffering
-    /// the client payload until the new leader is known should not cause a lot of overhead.
-    #[serde(bound="D: AppData, R: AppDataResponse, E: AppError")]
-    ForwardToLeader {
-        /// The original payload which this error is associated with.
-        payload: ClientPayload<D, R, E>,
-        /// The ID of the current Raft leader, if known.
-        leader: Option<NodeId>,
-    },
-}
-
-impl<D: AppData, R: AppDataResponse, E: AppError> std::fmt::Display for ClientError<D, R, E> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ClientError::Internal => write!(f, "An internal error was encountered in Raft."),
-            ClientError::Application(err) => write!(f, "{}", &err),
-            ClientError::ForwardToLeader{..} => write!(f, "The client payload must be forwarded to the Raft leader for processing."),
+    /// The response data payload, if this is an `Applied` client response.
+    pub fn data(&self) -> Option<&R> {
+        match &self {
+            Self::Committed{..} => None,
+            Self::Applied{data, ..} => Some(data),
         }
     }
 }
 
-impl<D: AppData, R: AppDataResponse, E: AppError> std::error::Error for ClientError<D, R, E> {}
+//////////////////////////////////////////////////////////////////////////////////////////////////
+//////////////////////////////////////////////////////////////////////////////////////////////////
 
+/// Initialize a pristine Raft node with the given config & start a campaign to become leader.
+pub struct InitWithConfig {
+    /// All currently known members to initialize the new cluster with.
+    ///
+    /// If the ID of the node this command is being submitted to is not present it will be added.
+    /// If there are duplicates, they will be filtered out to ensure config is proper.
+    pub members: Vec<NodeId>,
+}
+
+impl InitWithConfig {
+    /// Construct a new instance.
+    pub fn new(members: Vec<NodeId>) -> Self {
+        Self{members}
+    }
+}
+
+//////////////////////////////////////////////////////////////////////////////////////////////////
+//////////////////////////////////////////////////////////////////////////////////////////////////
+
+/// Propose a new membership config change to a running cluster.
+///
+/// There are a few invariants which must be upheld here:
+///
+/// - if the node this command is sent to is not the leader of the cluster, it will be rejected.
+/// - if the given changes would leave the cluster in an inoperable state, it will be rejected.
+pub struct ProposeConfigChange<D: AppData, R: AppDataResponse, E: AppError> {
+    /// New members to be added to the cluster.
+    pub(crate) add_members: Vec<NodeId>,
+    /// Members to be removed from the cluster.
+    pub(crate) remove_members: Vec<NodeId>,
+    marker_data: std::marker::PhantomData<D>,
+    marker_res: std::marker::PhantomData<R>,
+    marker_error: std::marker::PhantomData<E>,
+}
+
+impl<D: AppData, R: AppDataResponse, E: AppError> ProposeConfigChange<D, R, E> {
+    /// Create a new instance.
+    ///
+    /// If there are duplicates in either of the givenn vectors, they will be filtered out to
+    /// ensure config is proper.
+    pub fn new(add_members: Vec<NodeId>, remove_members: Vec<NodeId>) -> Self {
+        Self{
+            add_members, remove_members,
+            marker_data: std::marker::PhantomData,
+            marker_res: std::marker::PhantomData,
+            marker_error: std::marker::PhantomData,
+        }
+    }
+}

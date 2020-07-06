@@ -17,15 +17,11 @@
 //! value, but will also emit a new metrics record any time the `state` of the Raft node changes,
 //! the `membership_config` changes, or the `current_leader` changes.
 
-use actix::prelude::*;
-
-use crate::{
-    NodeId,
-    messages::MembershipConfig,
-};
+use crate::NodeId;
+use crate::raft::MembershipConfig;
 
 /// All possible states of a Raft node.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum State {
     /// The node is completely passive; replicating entries, but not voting or timing out.
     NonVoter,
@@ -41,7 +37,7 @@ pub enum State {
 ///
 /// See the [module level documentation](https://docs.rs/actix-raft/latest/actix_raft/metrics/index.html)
 /// for more details.
-#[derive(Clone, Debug, Message, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RaftMetrics {
     /// The ID of the Raft node.
     pub id: NodeId,
@@ -57,4 +53,10 @@ pub struct RaftMetrics {
     pub current_leader: Option<NodeId>,
     /// The current membership config of the cluster.
     pub membership_config: MembershipConfig,
+}
+
+impl RaftMetrics {
+    pub(crate) fn initial(id: NodeId, membership_config: MembershipConfig) -> Self {
+        Self{id, state: State::Follower, current_term: 0, last_log_index: 0, last_applied: 0, current_leader: None, membership_config}
+    }
 }
